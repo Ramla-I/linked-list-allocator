@@ -21,7 +21,7 @@ use hole::{Hole, HoleList};
 #[cfg(feature = "use_spin")]
 use spin::Mutex;
 
-mod hole;
+pub mod hole;
 #[cfg(test)]
 mod test;
 
