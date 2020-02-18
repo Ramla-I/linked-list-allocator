@@ -6,7 +6,7 @@ use super::align_up;
 
 /// A sorted list of holes. It uses the the holes itself to store its nodes.
 pub struct HoleList {
-    first: Hole, // dummy
+    pub first: Hole, // dummy
 }
 
 impl HoleList {
@@ -63,6 +63,39 @@ impl HoleList {
         })
     }
 
+    pub fn allocate_first_fit_with_padding(&mut self, layout: Layout) -> Result<Allocation, AllocErr> {
+        assert!(layout.size() >= Self::min_size());
+
+        allocate_first_fit(&mut self.first, layout)
+    }
+
+    /// Returns the first hole in the list. 
+    /// This should be only used when the higher level allocator implementation 
+    /// makes sure that all the holes in this list have the same size.
+    /// 
+    /// Returns None if there are no free chunks
+    pub fn allocate_first_with_padding(&mut self, layout: Layout) -> Result<Allocation, AllocErr> {
+        assert!(layout.size() >= Self::min_size());
+        // just return an allocation from the first hole since the extra padding will go into the unsorted bin
+        allocate_first(&mut self.first, layout)
+    }
+
+    // returns the first hole in the list
+    // assumes the exact size that's in the list is required so we don't split the hole.
+    pub fn allocate_first(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
+        assert!(layout.size() >= Self::min_size());
+
+        match self.first.next.take(){
+            Some(node) =>{
+                self.first.next = node.next.take();
+                Ok(node as *const Hole as *mut u8)
+            }
+            None => {
+                Err(AllocErr)
+            }
+        }
+    }
+
     /// Frees the allocation given by `ptr` and `layout`. `ptr` must be a pointer returned by a call
     /// to the `allocate_first_fit` function with identical layout. Undefined behavior may occur for
     /// invalid arguments.
@@ -71,6 +104,15 @@ impl HoleList {
     /// This operation is in `O(n)` since the list needs to be sorted by address.
     pub unsafe fn deallocate(&mut self, ptr: NonNull<u8>, layout: Layout) {
         deallocate(&mut self.first, ptr.as_ptr() as usize, layout.size())
+    }
+
+    pub unsafe fn deallocate_given_ptr_and_size(&mut self, ptr: usize, size: usize) {
+        deallocate(&mut self.first, ptr, size)
+    }
+
+
+    pub unsafe fn deallocate_unsorted(&mut self, addr: usize, mut size: usize) {
+        deallocate_unsorted(&mut self.first, addr, size);
     }
 
     /// Returns the minimal allocation size. Smaller allocations or deallocations are not allowed.
@@ -91,8 +133,8 @@ impl HoleList {
 /// A block containing free memory. It points to the next hole and thus forms a linked list.
 #[cfg(not(test))]
 pub struct Hole {
-    size: usize,
-    next: Option<&'static mut Hole>,
+    pub size: usize,
+    pub next: Option<&'static mut Hole>,
 }
 
 #[cfg(test)]
@@ -113,17 +155,17 @@ impl Hole {
 
 /// Basic information about a hole.
 #[derive(Debug, Clone, Copy)]
-struct HoleInfo {
-    addr: usize,
-    size: usize,
+pub struct HoleInfo {
+    pub addr: usize,
+    pub size: usize,
 }
 
 /// The result returned by `split_hole` and `allocate_first_fit`. Contains the address and size of
 /// the allocation (in the `info` field), and the front and back padding.
-struct Allocation {
-    info: HoleInfo,
-    front_padding: Option<HoleInfo>,
-    back_padding: Option<HoleInfo>,
+pub struct Allocation {
+    pub info: HoleInfo,
+    pub front_padding: Option<HoleInfo>,
+    pub back_padding: Option<HoleInfo>,
 }
 
 /// Splits the given hole into `(front_padding, hole, back_padding)` if it's big enough to allocate
@@ -131,7 +173,7 @@ struct Allocation {
 /// Front padding occurs if the required alignment is higher than the hole's alignment. Back
 /// padding occurs if the required size is smaller than the size of the aligned hole. All padding
 /// must be at least `HoleList::min_size()` big or the hole is unusable.
-fn split_hole(hole: HoleInfo, required_layout: Layout) -> Option<Allocation> {
+pub fn split_hole(hole: HoleInfo, required_layout: Layout) -> Option<Allocation> {
     let required_size = required_layout.size();
     let required_align = required_layout.align();
 
@@ -212,6 +254,26 @@ fn allocate_first_fit(mut previous: &mut Hole, layout: Layout) -> Result<Allocat
                 // this was the last hole, so no hole is big enough -> allocation not possible
                 return Err(AllocErr);
             }
+        }
+    }
+}
+
+/// returns an allocation from the first hole
+fn allocate_first(mut previous: &mut Hole, layout: Layout) -> Result<Allocation, AllocErr> {
+
+    let allocation: Option<Allocation> = previous
+        .next
+        .as_mut()
+        .and_then(|current| split_hole(current.info(), layout.clone()));
+    match allocation {
+        Some(allocation) => {
+            // hole is big enough, so remove it from the list by updating the previous pointer
+            previous.next = previous.next.as_mut().unwrap().next.take();
+            return Ok(allocation);
+        }
+        None => {
+            // this was the last hole, so no hole is big enough -> allocation not possible
+            return Err(AllocErr);
         }
     }
 }
@@ -302,6 +364,41 @@ fn deallocate(mut hole: &mut Hole, addr: usize, mut size: usize) {
         }
         break;
     }
+}
+
+/// Frees the allocation given by `(addr, size)`. It starts at the given hole and walks the list to
+/// find the correct place (the list is sorted by address).
+fn deallocate_unsorted(mut hole: &mut Hole, addr: usize, mut size: usize) {
+    assert!(size >= HoleList::min_size());
+
+    let hole_addr = if hole.size == 0 {
+        // It's the dummy hole, which is the head of the HoleList. It's somewhere on the stack,
+        // so it's address is not the address of the hole. We set the addr to 0 as it's always
+        // the first hole.
+        0
+    } else {
+        // tt's a real hole in memory and its address is the address of the hole
+        hole as *mut _ as usize
+    };
+
+    // Each freed block must be handled by the previous hole in memory. Thus the freed
+    // address must be always behind the current hole.
+    assert!(
+        hole_addr + hole.size <= addr,
+        "invalid deallocation (probably a double free)"
+    );
+
+    // now just add the free block to the front of the list
+    let new_hole = Hole {
+        size: size,
+        next: hole.next.take(), // the reference to the Y block (if it exists)
+    };
+    // write the new hole to the freed memory
+    debug_assert_eq!(addr % align_of::<Hole>(), 0);
+    let ptr = addr as *mut Hole;
+    unsafe { ptr.write(new_hole) };
+    // add the F block as the next block of the X block
+    hole.next = Some(unsafe { &mut *ptr });
 }
 
 /// Identity function to ease moving of references.
